@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: google-api-proxy
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PROXY_SECRET
+        sync: false
+    healthCheckPath: /health
+    plan: free
