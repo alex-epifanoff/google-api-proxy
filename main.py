@@ -56,9 +56,7 @@ ALLOWED_HOSTS = {
 }
 
 # Map: when the proxy is in EU, rewrite global endpoints to EU ones.
-# Set PROXY_REGION=eu to enable. Clients can still use global endpoints —
-# the proxy will transparently route to the nearest regional endpoint.
-PROXY_REGION = os.environ.get("PROXY_REGION", "")  # "", "eu", "europe-west3", etc.
+PROXY_REGION = os.environ.get("PROXY_REGION", "")
 
 EU_ENDPOINT_REWRITES = {
     "speech.googleapis.com": "eu-speech.googleapis.com",
@@ -70,73 +68,39 @@ REGIONAL_ENDPOINT_REWRITES = {
     "texttospeech.googleapis.com": "{region}-texttospeech.googleapis.com",
 }
 
-# Default Vertex AI region when PROXY_REGION is "eu" (confirmed working)
 _VERTEX_EU_DEFAULT_REGION = "europe-west1"
-
-# Regex to extract model name and action from generativelanguage.googleapis.com paths
-# e.g. "v1beta/models/gemini-2.5-flash:streamGenerateContent" -> ("gemini-2.5-flash", ":streamGenerateContent")
-_GEMINI_MODEL_RE = re.compile(r"v1(?:beta)?/models/([^/?]+)")
+_GEMINI_MODEL_RE = re.compile(r"v1beta/models/([^?]+)")
 
 
 def _resolve_host(target_host: str) -> str:
-    """Rewrite global host to regional if PROXY_REGION is set."""
     if not PROXY_REGION or target_host not in EU_ENDPOINT_REWRITES:
         return target_host
-
     if PROXY_REGION == "eu":
         return EU_ENDPOINT_REWRITES.get(target_host, target_host)
-
-    # Specific region like "europe-west3"
     template = REGIONAL_ENDPOINT_REWRITES.get(target_host)
     if template:
         return template.format(region=PROXY_REGION)
-
     return target_host
 
 
 def _vertex_region() -> str:
-    """Return the Vertex AI region based on PROXY_REGION."""
     if PROXY_REGION == "eu":
         return _VERTEX_EU_DEFAULT_REGION
-    return PROXY_REGION
+    return PROXY_REGION if PROXY_REGION else ""
 
 
-def _rewrite_gemini_to_vertex(path: str, query: str, project_id: str) -> str | None:
-    """Rewrite a generativelanguage.googleapis.com path to Vertex AI format.
-
-    Returns the full URL if rewriting is possible, None otherwise.
-
-    Input path example:
-        v1beta/models/gemini-2.5-flash:streamGenerateContent
-    Output URL:
-        https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/google/models/gemini-2.5-flash:streamGenerateContent
-    """
-    if not PROXY_REGION or not project_id:
+def _rewrite_gemini_to_vertex(path: str, project_id: str, region: str) -> tuple[str, str] | None:
+    m = _GEMINI_MODEL_RE.search(path)
+    if not m:
         return None
-
-    match = _GEMINI_MODEL_RE.search(path)
-    if not match:
-        return None
-
-    # model_and_action includes the model name and any :action suffix
-    # e.g. "gemini-2.5-flash:streamGenerateContent" or "gemini-2.5-flash"
-    model_and_action = match.group(1)
-
-    region = _vertex_region()
-    vertex_host = f"{region}-aiplatform.googleapis.com"
-    vertex_path = (
-        f"v1/projects/{project_id}/locations/{region}"
-        f"/publishers/google/models/{model_and_action}"
-    )
-    url = f"https://{vertex_host}/{vertex_path}"
-    if query:
-        url += f"?{query}"
-
-    return url
+    model_and_action = m.group(1)
+    host = f"{region}-aiplatform.googleapis.com"
+    new_path = f"v1/projects/{project_id}/locations/{region}/publishers/google/models/{model_and_action}"
+    return host, new_path
 
 
 # ---------------------------------------------------------------------------
-# Persistent HTTP client (connection pool with HTTP/2)
+# Persistent HTTP client (connection pool)
 # ---------------------------------------------------------------------------
 
 _http_client: httpx.AsyncClient | None = None
@@ -144,9 +108,7 @@ _http_client: httpx.AsyncClient | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage persistent HTTP client lifecycle."""
     global _http_client
-
     _http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(120.0, connect=10.0),
         follow_redirects=True,
@@ -197,19 +159,17 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# Diagnostics — measure latency to each Google Cloud service
+# Diagnostics
 # ---------------------------------------------------------------------------
 
 @app.get("/diagnostics")
 async def diagnostics(request: Request):
-    """Measure proxy-to-Google latency for each allowed host."""
     if not _check_auth(request):
         return PlainTextResponse("Unauthorized", status_code=401)
 
     client = _http_client or httpx.AsyncClient(timeout=5.0)
     results = {}
 
-    # Probe key hosts (global + EU regional for comparison)
     probe_hosts = [
         "speech.googleapis.com",
         "eu-speech.googleapis.com",
@@ -218,13 +178,9 @@ async def diagnostics(request: Request):
         "generativelanguage.googleapis.com",
         "oauth2.googleapis.com",
     ]
-
-    # Add Vertex AI EU endpoints when proxy is in EU
-    if PROXY_REGION:
-        region = _vertex_region()
-        vertex_host = f"{region}-aiplatform.googleapis.com"
-        if vertex_host not in probe_hosts:
-            probe_hosts.append(vertex_host)
+    region = _vertex_region()
+    if region:
+        probe_hosts.append(f"{region}-aiplatform.googleapis.com")
 
     for host in probe_hosts:
         t0 = time.perf_counter()
@@ -259,86 +215,53 @@ async def diagnostics(request: Request):
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
 )
 async def forward_request(request: Request, target_host: str, path: str):
-    """Forward request to target Google API host.
-
-    URL format: /proxy/{host}/{original_path}
-    Example:    /proxy/speech.googleapis.com/v2/projects/123/locations/global/recognizers/_:recognize
-
-    When PROXY_REGION is set and target is generativelanguage.googleapis.com,
-    requests are rewritten to the Vertex AI regional endpoint format.
-    The client should provide X-Project-ID header with the GCP project ID.
-    """
     if not _check_auth(request):
         return PlainTextResponse("Unauthorized", status_code=401)
 
     if target_host not in ALLOWED_HOSTS:
         return PlainTextResponse(f"Host not allowed: {target_host}", status_code=403)
 
-    # Forward headers, strip proxy-specific and hop-by-hop
     skip = {"host", "x-proxy-token", "x-project-id", "transfer-encoding", "connection", "content-length"}
     fwd_headers = {
         k: v for k, v in request.headers.items() if k.lower() not in skip
     }
-
     body = await request.body()
 
-    # --- Vertex AI rewrite for Gemini LLM requests ---
+    client = _http_client
+    if client is None:
+        return PlainTextResponse("Proxy not ready", status_code=503)
+
+    # --- Vertex AI rewrite for Gemini ---
     if target_host == "generativelanguage.googleapis.com" and PROXY_REGION:
         project_id = request.headers.get("x-project-id", "")
-        vertex_url = _rewrite_gemini_to_vertex(
-            path, str(request.url.query) if request.url.query else "", project_id
-        )
-        if vertex_url:
-            logger.info(
-                "Vertex AI rewrite: %s -> %s (%d bytes)",
-                path[:80], vertex_url[:120], len(body),
-            )
-
-            client = _http_client
-            if client is None:
-                return PlainTextResponse("Proxy not ready", status_code=503)
-
-            try:
-                resp = await client.request(
-                    method=request.method,
-                    url=vertex_url,
-                    headers=fwd_headers,
-                    content=body,
-                )
-
-                if resp.status_code >= 400:
-                    logger.warning(
-                        "Vertex AI returned %d for %s: %s",
-                        resp.status_code, vertex_url[:120], resp.text[:300],
+        region = _vertex_region()
+        if project_id and region:
+            result = _rewrite_gemini_to_vertex(path, project_id, region)
+            if result:
+                vertex_host, vertex_path = result
+                vertex_url = f"https://{vertex_host}/{vertex_path}"
+                if request.url.query:
+                    vertex_url += f"?{request.url.query}"
+                logger.info("Vertex AI rewrite: %s (%d bytes)", vertex_url[:120], len(body))
+                try:
+                    resp = await client.request(
+                        method=request.method, url=vertex_url,
+                        headers=fwd_headers, content=body,
                     )
+                    if resp.status_code >= 400:
+                        logger.warning("Vertex AI %d: %s", resp.status_code, resp.text[:300])
+                    resp_headers = {
+                        k: v for k, v in resp.headers.items()
+                        if k.lower() not in ("transfer-encoding", "connection", "content-encoding")
+                    }
+                    return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
+                except httpx.ConnectError as e:
+                    return PlainTextResponse(f"Upstream error: {e}", status_code=502)
+                except httpx.TimeoutException:
+                    return PlainTextResponse("Upstream timeout", status_code=504)
 
-                resp_headers = {
-                    k: v for k, v in resp.headers.items()
-                    if k.lower() not in ("transfer-encoding", "connection", "content-encoding")
-                }
-                return Response(
-                    content=resp.content,
-                    status_code=resp.status_code,
-                    headers=resp_headers,
-                )
-            except httpx.ConnectError as e:
-                logger.error("Vertex AI connect error: %s", e)
-                return PlainTextResponse(f"Upstream error: {e}", status_code=502)
-            except httpx.TimeoutException:
-                return PlainTextResponse("Upstream timeout", status_code=504)
-        else:
-            if not project_id:
-                logger.warning(
-                    "Gemini request without X-Project-ID header; "
-                    "cannot rewrite to Vertex AI, forwarding to global endpoint"
-                )
-
-    # --- Standard forwarding (non-Gemini or no PROXY_REGION) ---
-
-    # Rewrite to regional endpoint if proxy is in EU
+    # --- Standard forwarding ---
     resolved_host = _resolve_host(target_host)
-
-    # Rewrite location in STT resource paths: locations/global -> locations/eu
     resolved_path = path
     if PROXY_REGION and resolved_host != target_host:
         loc = "eu" if PROXY_REGION == "eu" else PROXY_REGION
@@ -350,29 +273,16 @@ async def forward_request(request: Request, target_host: str, path: str):
 
     logger.info("%s %s (%d bytes)", request.method, url[:120], len(body))
 
-    client = _http_client
-    if client is None:
-        return PlainTextResponse("Proxy not ready", status_code=503)
-
     try:
         resp = await client.request(
-            method=request.method,
-            url=url,
-            headers=fwd_headers,
-            content=body,
+            method=request.method, url=url, headers=fwd_headers, content=body,
         )
-
         resp_headers = {
             k: v for k, v in resp.headers.items()
             if k.lower() not in ("transfer-encoding", "connection", "content-encoding")
         }
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=resp_headers,
-        )
+        return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
     except httpx.ConnectError as e:
-        logger.error("Upstream connect error: %s", e)
         return PlainTextResponse(f"Upstream error: {e}", status_code=502)
     except httpx.TimeoutException:
         return PlainTextResponse("Upstream timeout", status_code=504)
@@ -382,38 +292,30 @@ async def forward_request(request: Request, target_host: str, path: str):
 # WebSocket → gRPC streaming bridge for Speech-to-Text v2
 # ---------------------------------------------------------------------------
 #
-# Protocol:
+# Session-persistent protocol (WS stays open for entire voice session):
+#
 #   1. Client opens WS to /ws/speech-stream
-#   2. Client sends JSON config:
-#      {
-#        "proxy_token": "...",
-#        "access_token": "...",          # OAuth2 access token for Google
-#        "recognizer": "projects/.../locations/.../recognizers/_",
-#        "config": {                     # RecognitionConfig fields
-#          "language_codes": ["ru-RU"],
-#          "model": "long",
-#          "encoding": "LINEAR16",       # optional, default LINEAR16
-#          "sample_rate_hertz": 16000,   # optional, default 16000
-#          "audio_channel_count": 1      # optional, default 1
-#        }
-#      }
-#   3. Client sends binary audio chunks (raw PCM or WAV)
-#   4. Server sends JSON results as they arrive:
-#      {"results": [{"alternatives": [{"transcript": "..."}], "is_final": true}]}
-#   5. Client closes WS (or sends {"command": "stop"}) to end the stream
+#   2. Client sends auth JSON: {"proxy_token": "...", "access_token": "...",
+#      "recognizer": "...", "config": {...}}
+#   3. Server responds: {"status": "ready"}
+#   4. For each speech turn:
+#      a. Client sends audio chunks (binary)
+#      b. Server sends partial results: {"results": [...]}
+#      c. Client sends {"command": "end_turn"} when speech ends
+#      d. Server sends final results + {"status": "turn_complete"}
+#   5. Client sends {"command": "close"} or closes WS to end session
 #
 
 @app.websocket("/ws/speech-stream")
 async def ws_speech_stream(ws: WebSocket):
-    """Bridge WebSocket audio stream to Google STT v2 gRPC streaming."""
+    """Session-persistent WS bridge to Google STT v2 gRPC streaming."""
     await ws.accept()
 
     try:
-        # Step 1: Receive config message
+        # Step 1: Auth + config (once per session)
         config_raw = await asyncio.wait_for(ws.receive_text(), timeout=10)
         config = json.loads(config_raw)
 
-        # Auth
         if not _check_auth_value(config.get("proxy_token", "")):
             await ws.send_json({"error": "Unauthorized"})
             await ws.close(code=4001, reason="Unauthorized")
@@ -428,17 +330,13 @@ async def ws_speech_stream(ws: WebSocket):
             await ws.close(code=4002, reason="Missing recognizer")
             return
 
-        # Rewrite recognizer location if proxy is in EU
-        # Client sends: projects/{id}/locations/global/recognizers/_
-        # EU endpoint requires: projects/{id}/locations/eu/recognizers/_
+        # Rewrite recognizer location for EU
         if PROXY_REGION == "eu" and "/locations/global/" in recognizer:
             recognizer = recognizer.replace("/locations/global/", "/locations/eu/")
         elif PROXY_REGION and PROXY_REGION != "eu" and "/locations/global/" in recognizer:
             recognizer = recognizer.replace("/locations/global/", f"/locations/{PROXY_REGION}/")
 
-        logger.info("WS speech-stream: recognizer=%s", recognizer[:80])
-
-        # Step 2: Open gRPC streaming channel to Google
+        # Import gRPC deps
         try:
             from google.cloud.speech_v2 import SpeechAsyncClient
             from google.cloud.speech_v2 import types as speech_types
@@ -448,22 +346,7 @@ async def ws_speech_stream(ws: WebSocket):
             await ws.close(code=4003, reason="Missing dependency")
             return
 
-        # Create credentials from the access token passed by the client
-        creds = oauth_credentials.Credentials(token=access_token)
-
-        # Use regional gRPC endpoint if proxy is in EU
-        client_kwargs = {"credentials": creds}
-        resolved_speech = _resolve_host("speech.googleapis.com")
-        if resolved_speech != "speech.googleapis.com":
-            from google.api_core import client_options
-            client_kwargs["client_options"] = client_options.ClientOptions(
-                api_endpoint=resolved_speech,
-            )
-            logger.info("WS speech-stream: using regional endpoint %s", resolved_speech)
-
-        client = SpeechAsyncClient(**client_kwargs)
-
-        # Build recognition config
+        # Build recognition config (reused across turns)
         encoding_map = {
             "LINEAR16": speech_types.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
             "MULAW": speech_types.ExplicitDecodingConfig.AudioEncoding.MULAW,
@@ -489,97 +372,124 @@ async def ws_speech_stream(ws: WebSocket):
             ),
         )
 
-        # Audio queue: WS receiver pushes chunks, gRPC sender pops them
-        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-
-        async def request_generator():
-            """Yield gRPC streaming requests: config first, then audio chunks."""
-            yield speech_types.StreamingRecognizeRequest(
-                recognizer=recognizer,
-                streaming_config=streaming_config,
+        # Create gRPC client (reused across turns)
+        creds = oauth_credentials.Credentials(token=access_token)
+        client_kwargs = {"credentials": creds}
+        resolved_speech = _resolve_host("speech.googleapis.com")
+        if resolved_speech != "speech.googleapis.com":
+            from google.api_core import client_options
+            client_kwargs["client_options"] = client_options.ClientOptions(
+                api_endpoint=resolved_speech,
             )
-            while True:
-                chunk = await audio_queue.get()
-                if chunk is None:
-                    break
-                yield speech_types.StreamingRecognizeRequest(audio=chunk)
 
-        # Step 3: Run bidirectional streaming
+        grpc_client = SpeechAsyncClient(**client_kwargs)
 
-        async def receive_audio():
-            """Receive audio chunks from WebSocket and push to gRPC queue."""
+        await ws.send_json({"status": "ready"})
+        logger.info("WS speech-stream: session started, recognizer=%s", recognizer[:80])
+
+        # Step 2: Turn loop — each turn opens a new gRPC stream
+        while True:
+            # Wait for audio or commands
+            audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+            turn_active = False
+            turn_results: list[dict] = []
+
+            async def request_generator():
+                yield speech_types.StreamingRecognizeRequest(
+                    recognizer=recognizer,
+                    streaming_config=streaming_config,
+                )
+                while True:
+                    chunk = await audio_queue.get()
+                    if chunk is None:
+                        break
+                    yield speech_types.StreamingRecognizeRequest(audio=chunk)
+
+            async def send_results(response_stream):
+                try:
+                    async for response in response_stream:
+                        results = []
+                        for result in response.results:
+                            alts = [{"transcript": a.transcript, "confidence": a.confidence}
+                                    for a in result.alternatives]
+                            results.append({
+                                "alternatives": alts,
+                                "is_final": result.is_final,
+                                "stability": result.stability,
+                            })
+                        if results:
+                            try:
+                                await ws.send_json({"results": results})
+                            except Exception:
+                                break
+                except Exception as e:
+                    logger.error("gRPC turn error: %s", e)
+                    try:
+                        await ws.send_json({"error": str(e)})
+                    except Exception:
+                        pass
+
+            send_task = None
+
             try:
                 while True:
                     msg = await ws.receive()
+
                     if msg["type"] == "websocket.disconnect":
-                        break
+                        if turn_active:
+                            await audio_queue.put(None)
+                        raise WebSocketDisconnect()
+
                     if "bytes" in msg and msg["bytes"]:
+                        if not turn_active:
+                            # First audio chunk starts a new turn
+                            turn_active = True
+                            response_stream = await grpc_client.streaming_recognize(
+                                requests=request_generator()
+                            )
+                            send_task = asyncio.create_task(send_results(response_stream))
+                            logger.debug("WS speech-stream: turn started")
+
                         await audio_queue.put(msg["bytes"])
+
                     elif "text" in msg and msg["text"]:
                         try:
                             cmd = json.loads(msg["text"])
-                            if cmd.get("command") == "stop":
-                                break
                         except json.JSONDecodeError:
-                            pass
+                            continue
+
+                        command = cmd.get("command", "")
+
+                        if command in ("end_turn", "stop"):
+                            if turn_active:
+                                await audio_queue.put(None)  # signal gRPC stream end
+                                if send_task:
+                                    try:
+                                        await asyncio.wait_for(send_task, timeout=10)
+                                    except asyncio.TimeoutError:
+                                        logger.warning("gRPC turn response timed out")
+                                        send_task.cancel()
+                                turn_active = False
+                                send_task = None
+                                await ws.send_json({"status": "turn_complete"})
+                                logger.debug("WS speech-stream: turn complete")
+
+                            if command == "stop":
+                                # Legacy compat: "stop" ends the session
+                                break
+
+                        elif command == "close":
+                            if turn_active:
+                                await audio_queue.put(None)
+                            break
+
             except WebSocketDisconnect:
                 pass
-            finally:
-                await audio_queue.put(None)  # signal end of audio
 
-        async def send_results():
-            """Receive gRPC streaming results and forward to WebSocket."""
-            try:
-                response_stream = await client.streaming_recognize(
-                    requests=request_generator()
-                )
-                async for response in response_stream:
-                    results = []
-                    for result in response.results:
-                        alts = []
-                        for alt in result.alternatives:
-                            alts.append({
-                                "transcript": alt.transcript,
-                                "confidence": alt.confidence,
-                            })
-                        results.append({
-                            "alternatives": alts,
-                            "is_final": result.is_final,
-                            "stability": result.stability,
-                        })
-                    if results:
-                        try:
-                            await ws.send_json({"results": results})
-                        except Exception:
-                            break
-            except Exception as e:
-                logger.error("gRPC streaming error: %s", e)
-                try:
-                    await ws.send_json({"error": str(e)})
-                except Exception:
-                    pass
-
-        recv_task = asyncio.create_task(receive_audio())
-        send_task = asyncio.create_task(send_results())
-
-        # Wait for send_results to finish naturally (after all audio processed)
-        try:
-            await asyncio.wait_for(send_task, timeout=60)
-        except asyncio.TimeoutError:
-            logger.warning("WS speech-stream: gRPC response timed out")
-            send_task.cancel()
-
-        if not recv_task.done():
-            recv_task.cancel()
-        for task in [recv_task, send_task]:
-            if not task.done():
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            break  # exit the outer turn loop
 
         # Cleanup gRPC client
-        transport = getattr(client, "_transport", None)
+        transport = getattr(grpc_client, "_transport", None)
         if transport and hasattr(transport, "close"):
             try:
                 await transport.close()
