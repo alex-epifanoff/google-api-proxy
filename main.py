@@ -204,6 +204,9 @@ async def ws_speech_stream(ws: WebSocket):
 
         streaming_config = speech_types.StreamingRecognitionConfig(
             config=rec_config,
+            streaming_features=speech_types.StreamingRecognitionFeatures(
+                interim_results=stt_config.get("interim_results", True),
+            ),
         )
 
         # Audio queue: WS receiver pushes chunks, gRPC sender pops them
