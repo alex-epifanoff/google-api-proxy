@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 
@@ -49,6 +50,7 @@ ALLOWED_HOSTS = {
     "europe-west3-texttospeech.googleapis.com",
     "europe-west4-texttospeech.googleapis.com",
     # Vertex AI regional (for Gemini via Vertex)
+    "europe-west1-aiplatform.googleapis.com",
     "europe-west3-aiplatform.googleapis.com",
     "europe-west4-aiplatform.googleapis.com",
 }
@@ -68,6 +70,13 @@ REGIONAL_ENDPOINT_REWRITES = {
     "texttospeech.googleapis.com": "{region}-texttospeech.googleapis.com",
 }
 
+# Default Vertex AI region when PROXY_REGION is "eu" (confirmed working)
+_VERTEX_EU_DEFAULT_REGION = "europe-west1"
+
+# Regex to extract model name and action from generativelanguage.googleapis.com paths
+# e.g. "v1beta/models/gemini-2.5-flash:streamGenerateContent" -> ("gemini-2.5-flash", ":streamGenerateContent")
+_GEMINI_MODEL_RE = re.compile(r"v1(?:beta)?/models/([^/?]+)")
+
 
 def _resolve_host(target_host: str) -> str:
     """Rewrite global host to regional if PROXY_REGION is set."""
@@ -83,6 +92,48 @@ def _resolve_host(target_host: str) -> str:
         return template.format(region=PROXY_REGION)
 
     return target_host
+
+
+def _vertex_region() -> str:
+    """Return the Vertex AI region based on PROXY_REGION."""
+    if PROXY_REGION == "eu":
+        return _VERTEX_EU_DEFAULT_REGION
+    return PROXY_REGION
+
+
+def _rewrite_gemini_to_vertex(path: str, query: str, project_id: str) -> str | None:
+    """Rewrite a generativelanguage.googleapis.com path to Vertex AI format.
+
+    Returns the full URL if rewriting is possible, None otherwise.
+
+    Input path example:
+        v1beta/models/gemini-2.5-flash:streamGenerateContent
+    Output URL:
+        https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/google/models/gemini-2.5-flash:streamGenerateContent
+    """
+    if not PROXY_REGION or not project_id:
+        return None
+
+    match = _GEMINI_MODEL_RE.search(path)
+    if not match:
+        return None
+
+    # model_and_action includes the model name and any :action suffix
+    # e.g. "gemini-2.5-flash:streamGenerateContent" or "gemini-2.5-flash"
+    model_and_action = match.group(1)
+
+    region = _vertex_region()
+    vertex_host = f"{region}-aiplatform.googleapis.com"
+    vertex_path = (
+        f"v1/projects/{project_id}/locations/{region}"
+        f"/publishers/google/models/{model_and_action}"
+    )
+    url = f"https://{vertex_host}/{vertex_path}"
+    if query:
+        url += f"?{query}"
+
+    return url
+
 
 # ---------------------------------------------------------------------------
 # Persistent HTTP client (connection pool with HTTP/2)
@@ -168,6 +219,13 @@ async def diagnostics(request: Request):
         "oauth2.googleapis.com",
     ]
 
+    # Add Vertex AI EU endpoints when proxy is in EU
+    if PROXY_REGION:
+        region = _vertex_region()
+        vertex_host = f"{region}-aiplatform.googleapis.com"
+        if vertex_host not in probe_hosts:
+            probe_hosts.append(vertex_host)
+
     for host in probe_hosts:
         t0 = time.perf_counter()
         try:
@@ -205,12 +263,77 @@ async def forward_request(request: Request, target_host: str, path: str):
 
     URL format: /proxy/{host}/{original_path}
     Example:    /proxy/speech.googleapis.com/v2/projects/123/locations/global/recognizers/_:recognize
+
+    When PROXY_REGION is set and target is generativelanguage.googleapis.com,
+    requests are rewritten to the Vertex AI regional endpoint format.
+    The client should provide X-Project-ID header with the GCP project ID.
     """
     if not _check_auth(request):
         return PlainTextResponse("Unauthorized", status_code=401)
 
     if target_host not in ALLOWED_HOSTS:
         return PlainTextResponse(f"Host not allowed: {target_host}", status_code=403)
+
+    # Forward headers, strip proxy-specific and hop-by-hop
+    skip = {"host", "x-proxy-token", "x-project-id", "transfer-encoding", "connection", "content-length"}
+    fwd_headers = {
+        k: v for k, v in request.headers.items() if k.lower() not in skip
+    }
+
+    body = await request.body()
+
+    # --- Vertex AI rewrite for Gemini LLM requests ---
+    if target_host == "generativelanguage.googleapis.com" and PROXY_REGION:
+        project_id = request.headers.get("x-project-id", "")
+        vertex_url = _rewrite_gemini_to_vertex(
+            path, str(request.url.query) if request.url.query else "", project_id
+        )
+        if vertex_url:
+            logger.info(
+                "Vertex AI rewrite: %s -> %s (%d bytes)",
+                path[:80], vertex_url[:120], len(body),
+            )
+
+            client = _http_client
+            if client is None:
+                return PlainTextResponse("Proxy not ready", status_code=503)
+
+            try:
+                resp = await client.request(
+                    method=request.method,
+                    url=vertex_url,
+                    headers=fwd_headers,
+                    content=body,
+                )
+
+                if resp.status_code >= 400:
+                    logger.warning(
+                        "Vertex AI returned %d for %s: %s",
+                        resp.status_code, vertex_url[:120], resp.text[:300],
+                    )
+
+                resp_headers = {
+                    k: v for k, v in resp.headers.items()
+                    if k.lower() not in ("transfer-encoding", "connection", "content-encoding")
+                }
+                return Response(
+                    content=resp.content,
+                    status_code=resp.status_code,
+                    headers=resp_headers,
+                )
+            except httpx.ConnectError as e:
+                logger.error("Vertex AI connect error: %s", e)
+                return PlainTextResponse(f"Upstream error: {e}", status_code=502)
+            except httpx.TimeoutException:
+                return PlainTextResponse("Upstream timeout", status_code=504)
+        else:
+            if not project_id:
+                logger.warning(
+                    "Gemini request without X-Project-ID header; "
+                    "cannot rewrite to Vertex AI, forwarding to global endpoint"
+                )
+
+    # --- Standard forwarding (non-Gemini or no PROXY_REGION) ---
 
     # Rewrite to regional endpoint if proxy is in EU
     resolved_host = _resolve_host(target_host)
@@ -224,14 +347,6 @@ async def forward_request(request: Request, target_host: str, path: str):
     url = f"https://{resolved_host}/{resolved_path}"
     if request.url.query:
         url += f"?{request.url.query}"
-
-    # Forward headers, strip proxy-specific and hop-by-hop
-    skip = {"host", "x-proxy-token", "transfer-encoding", "connection", "content-length"}
-    fwd_headers = {
-        k: v for k, v in request.headers.items() if k.lower() not in skip
-    }
-
-    body = await request.body()
 
     logger.info("%s %s (%d bytes)", request.method, url[:120], len(body))
 
