@@ -52,6 +52,7 @@ _http_client: httpx.AsyncClient | None = None
 async def lifespan(app: FastAPI):
     """Manage persistent HTTP client lifecycle."""
     global _http_client
+
     _http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(120.0, connect=10.0),
         follow_redirects=True,
@@ -60,9 +61,8 @@ async def lifespan(app: FastAPI):
             max_keepalive_connections=20,
             keepalive_expiry=120,
         ),
-        http2=True,
     )
-    logger.info("HTTP client pool started (HTTP/2 enabled, max_conn=50, keepalive=20)")
+    logger.info("HTTP client pool started (max_conn=50, keepalive=20)")
     yield
     await _http_client.aclose()
     _http_client = None
@@ -92,7 +92,7 @@ def _check_auth_value(token: str) -> bool:
 async def health():
     pool_info = None
     if _http_client:
-        pool_info = {"http2": True, "alive": True}
+        pool_info = {"alive": True}
     return {
         "status": "ok",
         "grpc_streaming": True,
