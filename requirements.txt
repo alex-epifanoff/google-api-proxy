@@ -1,3 +1,6 @@
 fastapi
 uvicorn[standard]
 httpx
+websockets
+google-cloud-speech>=2.0
+google-auth>=2.0
