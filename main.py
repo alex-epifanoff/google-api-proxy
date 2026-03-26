@@ -7,6 +7,7 @@ Google APIs through a non-restricted IP.
 Supports:
   1. REST forwarding — /proxy/{host}/{path}  (all Google REST APIs)
   2. WebSocket gRPC bridge — /ws/speech-stream  (STT v2 streaming recognition)
+  3. Diagnostics — /diagnostics  (latency to each Google service)
 
 Pipeline sets env vars:
   GOOGLE_PROXY_URL=https://your-proxy.onrender.com
@@ -17,6 +18,8 @@ import asyncio
 import json
 import logging
 import os
+import time
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -38,7 +41,35 @@ ALLOWED_HOSTS = {
     "www.googleapis.com",
 }
 
-app = FastAPI(title="Google API Proxy", docs_url=None, redoc_url=None)
+# ---------------------------------------------------------------------------
+# Persistent HTTP client (connection pool with HTTP/2)
+# ---------------------------------------------------------------------------
+
+_http_client: httpx.AsyncClient | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage persistent HTTP client lifecycle."""
+    global _http_client
+    _http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0, connect=10.0),
+        follow_redirects=True,
+        limits=httpx.Limits(
+            max_connections=50,
+            max_keepalive_connections=20,
+            keepalive_expiry=120,
+        ),
+        http2=True,
+    )
+    logger.info("HTTP client pool started (HTTP/2 enabled, max_conn=50, keepalive=20)")
+    yield
+    await _http_client.aclose()
+    _http_client = None
+    logger.info("HTTP client pool closed")
+
+
+app = FastAPI(title="Google API Proxy", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -49,17 +80,65 @@ def _check_auth(request: Request) -> bool:
     return token == PROXY_SECRET
 
 
+def _check_auth_value(token: str) -> bool:
+    return token == PROXY_SECRET
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "grpc_streaming": True}
+    pool_info = None
+    if _http_client:
+        pool_info = {"http2": True, "alive": True}
+    return {
+        "status": "ok",
+        "grpc_streaming": True,
+        "connection_pool": pool_info,
+        "region": os.environ.get("RENDER_REGION", "unknown"),
+    }
 
 
 # ---------------------------------------------------------------------------
-# REST forward proxy (existing)
+# Diagnostics — measure latency to each Google Cloud service
+# ---------------------------------------------------------------------------
+
+@app.get("/diagnostics")
+async def diagnostics(request: Request):
+    """Measure proxy-to-Google latency for each allowed host."""
+    if not _check_auth(request):
+        return PlainTextResponse("Unauthorized", status_code=401)
+
+    client = _http_client or httpx.AsyncClient(timeout=5.0)
+    results = {}
+
+    for host in sorted(ALLOWED_HOSTS):
+        t0 = time.perf_counter()
+        try:
+            resp = await client.head(f"https://{host}/", timeout=5.0)
+            ms = (time.perf_counter() - t0) * 1000
+            results[host] = {
+                "latency_ms": round(ms, 1),
+                "status": resp.status_code,
+                "server": resp.headers.get("server", ""),
+                "alt_svc": resp.headers.get("alt-svc", "")[:80],
+            }
+        except Exception as e:
+            ms = (time.perf_counter() - t0) * 1000
+            results[host] = {"latency_ms": round(ms, 1), "error": str(e)[:120]}
+
+    return {
+        "proxy_region": os.environ.get("RENDER_REGION", "unknown"),
+        "render_service": os.environ.get("RENDER_SERVICE_NAME", "unknown"),
+        "pool_active": _http_client is not None,
+        "targets": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# REST forward proxy — uses persistent connection pool
 # ---------------------------------------------------------------------------
 
 @app.api_route(
@@ -92,14 +171,17 @@ async def forward_request(request: Request, target_host: str, path: str):
 
     logger.info("%s %s (%d bytes)", request.method, url[:120], len(body))
 
+    client = _http_client
+    if client is None:
+        return PlainTextResponse("Proxy not ready", status_code=503)
+
     try:
-        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
-            resp = await client.request(
-                method=request.method,
-                url=url,
-                headers=fwd_headers,
-                content=body,
-            )
+        resp = await client.request(
+            method=request.method,
+            url=url,
+            headers=fwd_headers,
+            content=body,
+        )
 
         resp_headers = {
             k: v for k, v in resp.headers.items()
@@ -153,7 +235,7 @@ async def ws_speech_stream(ws: WebSocket):
         config = json.loads(config_raw)
 
         # Auth
-        if config.get("proxy_token") != PROXY_SECRET:
+        if not _check_auth_value(config.get("proxy_token", "")):
             await ws.send_json({"error": "Unauthorized"})
             await ws.close(code=4001, reason="Unauthorized")
             return
@@ -214,23 +296,17 @@ async def ws_speech_stream(ws: WebSocket):
 
         async def request_generator():
             """Yield gRPC streaming requests: config first, then audio chunks."""
-            # First message: streaming config
             yield speech_types.StreamingRecognizeRequest(
                 recognizer=recognizer,
                 streaming_config=streaming_config,
             )
-            # Subsequent messages: audio data from the queue
             while True:
                 chunk = await audio_queue.get()
-                if chunk is None:  # sentinel: end of stream
+                if chunk is None:
                     break
                 yield speech_types.StreamingRecognizeRequest(audio=chunk)
 
         # Step 3: Run bidirectional streaming
-        # - Task A: receive audio from WS, push to queue
-        # - Task B: receive results from gRPC, send to WS
-
-        stream_ended = asyncio.Event()
 
         async def receive_audio():
             """Receive audio chunks from WebSocket and push to gRPC queue."""
@@ -252,7 +328,6 @@ async def ws_speech_stream(ws: WebSocket):
                 pass
             finally:
                 await audio_queue.put(None)  # signal end of audio
-                stream_ended.set()
 
         async def send_results():
             """Receive gRPC streaming results and forward to WebSocket."""
@@ -278,7 +353,7 @@ async def ws_speech_stream(ws: WebSocket):
                         try:
                             await ws.send_json({"results": results})
                         except Exception:
-                            break  # WS closed
+                            break
             except Exception as e:
                 logger.error("gRPC streaming error: %s", e)
                 try:
@@ -286,22 +361,16 @@ async def ws_speech_stream(ws: WebSocket):
                 except Exception:
                     pass
 
-        # Run both tasks concurrently
         recv_task = asyncio.create_task(receive_audio())
         send_task = asyncio.create_task(send_results())
 
-        # Wait for send_results to finish — it naturally ends when gRPC
-        # stream closes (after request_generator yields all audio + sentinel).
-        # recv_task feeds the queue; send_task drains gRPC responses.
-        # If recv_task fails (WS disconnect), the sentinel is still pushed
-        # via the finally block, so send_task will eventually finish.
+        # Wait for send_results to finish naturally (after all audio processed)
         try:
             await asyncio.wait_for(send_task, timeout=60)
         except asyncio.TimeoutError:
             logger.warning("WS speech-stream: gRPC response timed out")
             send_task.cancel()
 
-        # Cleanup recv_task if still running
         if not recv_task.done():
             recv_task.cancel()
         for task in [recv_task, send_task]:
