@@ -34,12 +34,55 @@ logger = logging.getLogger("google-proxy")
 PROXY_SECRET = os.environ.get("PROXY_SECRET", "change-me")
 
 ALLOWED_HOSTS = {
+    # Global endpoints
     "speech.googleapis.com",
     "texttospeech.googleapis.com",
     "generativelanguage.googleapis.com",
     "oauth2.googleapis.com",
     "www.googleapis.com",
+    # EU regional endpoints
+    "eu-speech.googleapis.com",
+    "eu-texttospeech.googleapis.com",
+    # Regional endpoints (europe-west3 = Frankfurt, europe-west4 = Netherlands)
+    "europe-west3-speech.googleapis.com",
+    "europe-west4-speech.googleapis.com",
+    "europe-west3-texttospeech.googleapis.com",
+    "europe-west4-texttospeech.googleapis.com",
+    # Vertex AI regional (for Gemini via Vertex)
+    "europe-west3-aiplatform.googleapis.com",
+    "europe-west4-aiplatform.googleapis.com",
 }
+
+# Map: when the proxy is in EU, rewrite global endpoints to EU ones.
+# Set PROXY_REGION=eu to enable. Clients can still use global endpoints —
+# the proxy will transparently route to the nearest regional endpoint.
+PROXY_REGION = os.environ.get("PROXY_REGION", "")  # "", "eu", "europe-west3", etc.
+
+EU_ENDPOINT_REWRITES = {
+    "speech.googleapis.com": "eu-speech.googleapis.com",
+    "texttospeech.googleapis.com": "eu-texttospeech.googleapis.com",
+}
+
+REGIONAL_ENDPOINT_REWRITES = {
+    "speech.googleapis.com": "{region}-speech.googleapis.com",
+    "texttospeech.googleapis.com": "{region}-texttospeech.googleapis.com",
+}
+
+
+def _resolve_host(target_host: str) -> str:
+    """Rewrite global host to regional if PROXY_REGION is set."""
+    if not PROXY_REGION or target_host not in EU_ENDPOINT_REWRITES:
+        return target_host
+
+    if PROXY_REGION == "eu":
+        return EU_ENDPOINT_REWRITES.get(target_host, target_host)
+
+    # Specific region like "europe-west3"
+    template = REGIONAL_ENDPOINT_REWRITES.get(target_host)
+    if template:
+        return template.format(region=PROXY_REGION)
+
+    return target_host
 
 # ---------------------------------------------------------------------------
 # Persistent HTTP client (connection pool with HTTP/2)
@@ -97,7 +140,8 @@ async def health():
         "status": "ok",
         "grpc_streaming": True,
         "connection_pool": pool_info,
-        "region": os.environ.get("RENDER_REGION", "unknown"),
+        "proxy_region": PROXY_REGION or "global",
+        "render_region": os.environ.get("RENDER_REGION", "unknown"),
     }
 
 
@@ -114,25 +158,36 @@ async def diagnostics(request: Request):
     client = _http_client or httpx.AsyncClient(timeout=5.0)
     results = {}
 
-    for host in sorted(ALLOWED_HOSTS):
+    # Probe key hosts (global + EU regional for comparison)
+    probe_hosts = [
+        "speech.googleapis.com",
+        "eu-speech.googleapis.com",
+        "texttospeech.googleapis.com",
+        "eu-texttospeech.googleapis.com",
+        "generativelanguage.googleapis.com",
+        "oauth2.googleapis.com",
+    ]
+
+    for host in probe_hosts:
         t0 = time.perf_counter()
         try:
             resp = await client.head(f"https://{host}/", timeout=5.0)
             ms = (time.perf_counter() - t0) * 1000
+            resolved = _resolve_host(host)
             results[host] = {
                 "latency_ms": round(ms, 1),
                 "status": resp.status_code,
-                "server": resp.headers.get("server", ""),
-                "alt_svc": resp.headers.get("alt-svc", "")[:80],
+                "resolved_to": resolved if resolved != host else None,
             }
         except Exception as e:
             ms = (time.perf_counter() - t0) * 1000
             results[host] = {"latency_ms": round(ms, 1), "error": str(e)[:120]}
 
     return {
-        "proxy_region": os.environ.get("RENDER_REGION", "unknown"),
+        "proxy_region": PROXY_REGION or "global",
         "render_service": os.environ.get("RENDER_SERVICE_NAME", "unknown"),
         "pool_active": _http_client is not None,
+        "endpoint_rewrites_active": bool(PROXY_REGION),
         "targets": results,
     }
 
@@ -157,7 +212,9 @@ async def forward_request(request: Request, target_host: str, path: str):
     if target_host not in ALLOWED_HOSTS:
         return PlainTextResponse(f"Host not allowed: {target_host}", status_code=403)
 
-    url = f"https://{target_host}/{path}"
+    # Rewrite to regional endpoint if proxy is in EU
+    resolved_host = _resolve_host(target_host)
+    url = f"https://{resolved_host}/{path}"
     if request.url.query:
         url += f"?{request.url.query}"
 
@@ -263,7 +320,18 @@ async def ws_speech_stream(ws: WebSocket):
 
         # Create credentials from the access token passed by the client
         creds = oauth_credentials.Credentials(token=access_token)
-        client = SpeechAsyncClient(credentials=creds)
+
+        # Use regional gRPC endpoint if proxy is in EU
+        client_kwargs = {"credentials": creds}
+        resolved_speech = _resolve_host("speech.googleapis.com")
+        if resolved_speech != "speech.googleapis.com":
+            from google.api_core import client_options
+            client_kwargs["client_options"] = client_options.ClientOptions(
+                api_endpoint=resolved_speech,
+            )
+            logger.info("WS speech-stream: using regional endpoint %s", resolved_speech)
+
+        client = SpeechAsyncClient(**client_kwargs)
 
         # Build recognition config
         encoding_map = {
