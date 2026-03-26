@@ -214,7 +214,14 @@ async def forward_request(request: Request, target_host: str, path: str):
 
     # Rewrite to regional endpoint if proxy is in EU
     resolved_host = _resolve_host(target_host)
-    url = f"https://{resolved_host}/{path}"
+
+    # Rewrite location in STT resource paths: locations/global -> locations/eu
+    resolved_path = path
+    if PROXY_REGION and resolved_host != target_host:
+        loc = "eu" if PROXY_REGION == "eu" else PROXY_REGION
+        resolved_path = path.replace("/locations/global/", f"/locations/{loc}/")
+
+    url = f"https://{resolved_host}/{resolved_path}"
     if request.url.query:
         url += f"?{request.url.query}"
 
@@ -305,6 +312,14 @@ async def ws_speech_stream(ws: WebSocket):
             await ws.send_json({"error": "Missing 'recognizer' in config"})
             await ws.close(code=4002, reason="Missing recognizer")
             return
+
+        # Rewrite recognizer location if proxy is in EU
+        # Client sends: projects/{id}/locations/global/recognizers/_
+        # EU endpoint requires: projects/{id}/locations/eu/recognizers/_
+        if PROXY_REGION == "eu" and "/locations/global/" in recognizer:
+            recognizer = recognizer.replace("/locations/global/", "/locations/eu/")
+        elif PROXY_REGION and PROXY_REGION != "eu" and "/locations/global/" in recognizer:
+            recognizer = recognizer.replace("/locations/global/", f"/locations/{PROXY_REGION}/")
 
         logger.info("WS speech-stream: recognizer=%s", recognizer[:80])
 
