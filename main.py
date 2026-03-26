@@ -287,19 +287,26 @@ async def ws_speech_stream(ws: WebSocket):
         recv_task = asyncio.create_task(receive_audio())
         send_task = asyncio.create_task(send_results())
 
-        # Wait for either to finish
-        done, pending = await asyncio.wait(
-            [recv_task, send_task],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        # Wait for send_results to finish — it naturally ends when gRPC
+        # stream closes (after request_generator yields all audio + sentinel).
+        # recv_task feeds the queue; send_task drains gRPC responses.
+        # If recv_task fails (WS disconnect), the sentinel is still pushed
+        # via the finally block, so send_task will eventually finish.
+        try:
+            await asyncio.wait_for(send_task, timeout=60)
+        except asyncio.TimeoutError:
+            logger.warning("WS speech-stream: gRPC response timed out")
+            send_task.cancel()
 
-        # Cancel remaining task and wait for cleanup
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        # Cleanup recv_task if still running
+        if not recv_task.done():
+            recv_task.cancel()
+        for task in [recv_task, send_task]:
+            if not task.done():
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         # Cleanup gRPC client
         transport = getattr(client, "_transport", None)
